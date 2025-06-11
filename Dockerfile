@@ -25,7 +25,7 @@ COPY --from=builder /app/service /app/service
 COPY ./migrations ./migrations
 
 # Expose port if we were running an HTTP server (good practice to keep)
-# EXPOSE 8080
+EXPOSE 8080
 
 # Command to run the application
 CMD ["/app/service"]

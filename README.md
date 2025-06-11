@@ -3,11 +3,6 @@
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8.svg)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# GitHub Data Fetcher Service
-
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8.svg)](https://go.dev/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
 A robust, production-grade service written in Go that fetches repository and commit data from the GitHub API, stores it in a PostgreSQL database, and continuously monitors for new commits.
 
 This project is built with an emphasis on clean architecture, best practices, and maintainability, demonstrating a senior-level approach to software engineering.
@@ -47,24 +42,24 @@ Follow these steps to get the service running in under 5 minutes.
 
 ### Step 1: Clone the Repository
 
-```sh
-Open your terminal and clone this project to your local machine.
+```bash
 git clone https://github.com/toluwase1/github-data-fetcher.git
 cd github-data-fetcher
-
-
-Step 2: Create Your Configuration File
-This project uses a .env file to store secret keys and configuration. Create your own by copying the example file.
-
-cp .env.example .env
-# This will create a new file named .env in the project root.
 ```
 
-Step 3: Edit the .env File
-Now, open the newly created .env file in your favorite text editor. You need to fill in a few key values.
+### Step 2: Create Your Configuration File
 
-# .env
+This project uses a `.env` file to store secret keys and configuration. Create your own by copying the example file:
 
+```bash
+cp .env.example .env
+```
+
+### Step 3: Edit the .env File
+
+Now, open the newly created `.env` file in your favorite text editor. You need to fill in a few key values:
+
+```env
 # Log level: debug, info, warn, error
 LOG_LEVEL=info
 
@@ -90,62 +85,92 @@ SYNC_INTERVAL="1h"
 # Format is RFC3339.
 # For massive repos like chromium, use a recent date to avoid a very long initial sync.
 DEFAULT_SYNC_SINCE_DATE="2024-04-01T00:00:00Z"
+```
 
-# Step 4: Launch the Service!
-With your configuration saved, you can now build and run the entire application with a single command.
+### Step 4: Launch the Service!
 
+With your configuration saved, you can now build and run the entire application with a single command:
+
+```bash
 docker-compose up --build -d
+```
 
---build: Builds the Go application image from the Dockerfile.
--d: Runs the containers in "detached mode" (in the background).
+- `--build`: Builds the Go application image from the Dockerfile.
+- `-d`: Runs the containers in "detached mode" (in the background).
 
+### Step 5: Check the Logs
 
-# Step 5: Check the Logs
-You can see what the service is doing by viewing its logs.
+You can see what the service is doing by viewing its logs:
 
+```bash
 docker-compose logs -f app
+```
 
 You should see output indicating that the configuration was loaded, the database was connected, and a sync cycle has started.
-📊 How to Query the Data
-Once the service is running, you can ask questions of the data you've collected. The easiest way is to use docker exec to run a psql command inside the database container.
-Query 1: Get the Top 10 Commit Authors
+
+## 📊 How to Query the Data
+
+Once the service is running, you can ask questions of the data you've collected. The easiest way is to use `docker exec` to run a psql command inside the database container.
+
+### Query 1: Get the Top 10 Commit Authors
+
 This query finds who the most active committers are for a specific repository (e.g., google/chromium).
+
 First, find the repository's internal ID:
 
+```bash
 docker-compose exec -u postgres db psql -d github_data -c "SELECT id, owner, name FROM repositories WHERE owner = 'google' AND name = 'chromium';"
-(This will give you a result like id = 1)
-Then, use that ID to get the top authors:
-(Replace 1 in the command below with the ID you found)
+```
 
+Then, use that ID to get the top authors (replace `1` with the ID you found):
+
+```bash
 docker-compose exec -u postgres db psql -d github_data -c "SELECT author_name, COUNT(*) as commit_count FROM commits WHERE repository_id = 1 GROUP BY author_name ORDER BY commit_count DESC LIMIT 10;"
+```
 
-Query 2: Get the 50 Most Recent Commits
-This query retrieves the latest commits for a repository (e.g., golang/go) without needing to look up the ID first.
+### Query 2: Get the 50 Most Recent Commits
 
+This query retrieves the latest commits for a repository (e.g., golang/go) without needing to look up the ID first:
+
+```bash
 docker-compose exec -u postgres db psql -d github_data -c "SELECT c.sha, c.message, c.author_name, c.commit_date FROM commits c JOIN repositories r ON c.repository_id = r.id WHERE r.owner = 'golang' AND r.name = 'go' ORDER BY c.commit_date DESC LIMIT 50;"
+```
 
-# 📝 Other Commands
-Running Unit Tests
-To run the Go unit tests, execute the following command from the project root.
+## 📝 Other Commands
 
+### Running Unit Tests
+
+To run the Go unit tests, execute the following command from the project root:
+
+```bash
 go test -v ./...
+```
 
-# Resetting Data for a Repository
+### Resetting Data for a Repository
+
 If you want to force the service to re-fetch all commits for a specific repository, you can delete its existing commits from the database.
-First, find the repository's ID (using the same method as in Query 1).
-Then, use the ID to delete its commits. (Example uses id = 1)
 
-# docker-compose exec -u postgres db psql -d github_data -c "DELETE FROM commits WHERE repository_id = 1;"
+First, find the repository's ID (using the same method as in Query 1). Then, use the ID to delete its commits (example uses id = 1):
 
-On the next sync cycle, the service will see that no commits exist and will perform a full re-sync from the DEFAULT_SYNC_SINCE_DATE.
-Stopping the Service
+```bash
+docker-compose exec -u postgres db psql -d github_data -c "DELETE FROM commits WHERE repository_id = 1;"
+```
+
+On the next sync cycle, the service will see that no commits exist and will perform a full re-sync from the `DEFAULT_SYNC_SINCE_DATE`.
+
+### Stopping the Service
+
 To stop and remove the running containers:
 
-#### docker-compose down
+```bash
+docker-compose down
+```
 
-# 📂 Project Structure
-The project follows a standard, scalable Go layout that promotes a clean separation of concerns.
+## 📂 Project Structure
 
+The project follows a standard, scalable Go layout that promotes a clean separation of concerns:
+
+```
 .
 ├── cmd/service/        # Main application entry point.
 ├── internal/           # Private application code.
@@ -159,3 +184,63 @@ The project follows a standard, scalable Go layout that promotes a clean separat
 ├── .env.example        # Example configuration file.
 ├── Dockerfile          # Container build instructions.
 └── docker-compose.yml  # Service definitions.
+```
+
+## 🚀 API Endpoints
+
+The service exposes a RESTful API on port `8080` for querying the collected data.
+
+### Get All Commits for a Repository
+
+Retrieves a list of all commits stored in the database for a specific repository.
+
+-   **Endpoint**: `GET /v1/repos/{owner}/{name}/commits`
+-   **Success Response**: `200 OK`
+    ```json
+    [
+      {
+        "sha": "a1b2c3d4...",
+        "repository_id": 1,
+        "author_name": "Toluwase",
+        "author_email": "tolu@example.com",
+        "message": "feat: Implement the API layer",
+        "url": "https://github.com/...",
+        "commit_date": "2024-05-21T10:00:00Z",
+        "created_at": "2024-05-21T10:05:00Z",
+        "status": "active"
+      }
+    ]
+    ```
+-   **Example with `curl`**:
+    ```bash
+    curl http://localhost:8080/v1/repos/golang/go/commits
+    ```
+
+### Get Top Commit Authors
+
+Retrieves a list of the most active commit authors for a repository, ranked by commit count.
+
+-   **Endpoint**: `GET /v1/repos/{owner}/{name}/stats/top-committers`
+-   **Query Parameters**:
+    -   `limit` (integer, optional, default: 10, max: 100): The number of top authors to return.
+-   **Success Response**: `200 OK`
+    ```json
+    [
+      {
+        "author_name": "Toluwase",
+        "author_email": "tolu@example.com",
+        "commit_count": 50
+      },
+      {
+        "author_name": "Another Dev",
+        "author_email": "dev@example.com",
+        "commit_count": 42
+      }
+    ]
+    ```
+-   **Example with `curl`**:
+    ```bash
+    curl "http://localhost:8080/v1/repos/golang/go/stats/top-committers?limit=5"
+    ```
+
+---
