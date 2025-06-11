@@ -5,15 +5,23 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"github-data-fetcher/internal/model"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"github-data-fetcher/internal/database"
+	custom_errors "github-data-fetcher/internal/errors"
 	"github-data-fetcher/internal/github"
+	"github-data-fetcher/internal/model"
+)
+
+const (
+	// Number of repositories to sync in parallel
+	concurrency = 5
 )
 
 // RepoIdentifier holds the owner and name of a repository.
@@ -22,9 +30,9 @@ type RepoIdentifier struct {
 	Name  string
 }
 
-// Syncer orchestrates the fetching of data from the GitHub API and storing it in the database.
+// Syncer orchestrates the fetching and storing of data.
 type Syncer struct {
-	db           database.Querier
+	dbpool       *pgxpool.Pool
 	ghClient     *github.Client
 	logger       *slog.Logger
 	reposToSync  []RepoIdentifier
@@ -33,14 +41,14 @@ type Syncer struct {
 }
 
 // NewSyncer creates a new Syncer instance.
-func NewSyncer(db database.Querier, ghClient *github.Client, logger *slog.Logger, repos []string, interval time.Duration, defaultSince time.Time) (*Syncer, error) {
+func NewSyncer(dbpool *pgxpool.Pool, ghClient *github.Client, logger *slog.Logger, repos []string, interval time.Duration, defaultSince time.Time) (*Syncer, error) {
 	parsedRepos, err := parseRepoIdentifiers(repos)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Syncer{
-		db:           db,
+		dbpool:       dbpool,
 		ghClient:     ghClient,
 		logger:       logger,
 		reposToSync:  parsedRepos,
@@ -50,15 +58,12 @@ func NewSyncer(db database.Querier, ghClient *github.Client, logger *slog.Logger
 }
 
 // Start begins the continuous synchronization process.
-// It performs an initial sync immediately and then ticks at the configured interval.
-// This method blocks until the context is canceled.
 func (s *Syncer) Start(ctx context.Context) {
-	s.logger.Info("Starting syncer", "interval", s.syncInterval.String())
+	s.logger.Info("Starting syncer", "interval", s.syncInterval.String(), "concurrency", concurrency)
 	ticker := time.NewTicker(s.syncInterval)
 	defer ticker.Stop()
 
-	// Perform an initial sync immediately on startup.
-	s.runSyncCycle(ctx)
+	s.runSyncCycle(ctx) // Initial sync
 
 	for {
 		select {
@@ -71,47 +76,73 @@ func (s *Syncer) Start(ctx context.Context) {
 	}
 }
 
-// runSyncCycle performs a single synchronization pass for all configured repositories.
+// runSyncCycle performs a synchronization pass for all configured repositories concurrently.
 func (s *Syncer) runSyncCycle(ctx context.Context) {
 	s.logger.Info("Starting new sync cycle")
-	for _, repoIdentifier := range s.reposToSync {
-		if err := ctx.Err(); err != nil {
-			s.logger.Warn("Sync cycle aborted due to context cancellation", "repo", repoIdentifier)
-			break
-		}
-		if err := s.syncRepo(ctx, repoIdentifier); err != nil {
-			s.logger.Error("Failed to sync repository", "repo", repoIdentifier, "error", err)
-		}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	for _, repoID := range s.reposToSync {
+		repoID := repoID
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil
+			}
+			err := s.syncRepoInTransaction(gctx, repoID)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Error("Failed to sync repository", "owner", repoID.Owner, "repo", repoID.Name, "error", err)
+			}
+			return nil
+		})
 	}
-	s.logger.Info("Sync cycle finished")
+
+	if err := g.Wait(); err != nil {
+		s.logger.Error("Sync cycle finished with an error", "error", err)
+	} else {
+		s.logger.Info("Sync cycle finished")
+	}
+}
+
+// syncRepoInTransaction wraps the sync logic for a single repo in a DB transaction.
+func (s *Syncer) syncRepoInTransaction(ctx context.Context, id RepoIdentifier) error {
+	tx, err := s.dbpool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // Rollback is a no-op if the transaction is already committed.
+
+	qtx := database.New(tx)
+	err = s.syncRepo(ctx, qtx, id)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // syncRepo handles the full synchronization logic for a single repository.
-func (s *Syncer) syncRepo(ctx context.Context, id RepoIdentifier) error {
+func (s *Syncer) syncRepo(ctx context.Context, q database.Querier, id RepoIdentifier) error {
+	// ** THIS IS THE CORRECTED LINE **
 	logger := s.logger.With("owner", id.Owner, "repo", id.Name)
 	logger.Info("Syncing repository")
 
-	// 1. Fetch latest repo metadata from GitHub.
 	ghRepo, err := s.ghClient.GetRepository(ctx, id.Owner, id.Name)
 	if err != nil {
 		return err
 	}
 
-	// 2. Upsert repository data into our DB. This ensures the repo record is present and up-to-date.
-	dbRepo, err := s.upsertRepository(ctx, ghRepo)
+	dbRepo, err := s.upsertRepository(ctx, q, ghRepo)
 	if err != nil {
 		return err
 	}
 	logger = logger.With("repo_id", dbRepo.ID)
 
-	// 3. Determine the timestamp from which to fetch commits.
-	since, err := s.getSinceTimestamp(ctx, dbRepo.ID)
+	since, err := s.getSinceTimestamp(ctx, q, dbRepo.ID)
 	if err != nil {
 		return err
 	}
 	logger.Info("Fetching commits since", "timestamp", since.Format(time.RFC3339))
 
-	// 4. Fetch new commits from GitHub.
 	commits, err := s.ghClient.GetCommits(ctx, id.Owner, id.Name, since)
 	if err != nil {
 		return err
@@ -119,14 +150,13 @@ func (s *Syncer) syncRepo(ctx context.Context, id RepoIdentifier) error {
 
 	if len(commits) == 0 {
 		logger.Info("No new commits found")
-		// Still update the repo's last_synced_at time
-		_, err := s.db.UpdateRepositorySyncData(ctx, database.UpdateRepositorySyncDataParams{ID: dbRepo.ID})
+		// Still update repo sync time even if no new commits, and do it inside the transaction.
+		_, err := q.UpdateRepositorySyncData(ctx, database.UpdateRepositorySyncDataParams{ID: dbRepo.ID})
 		return err
 	}
 
-	// 5. Bulk insert new commits into the database.
 	logger.Info("Found new commits", "count", len(commits))
-	n, err := s.db.CreateCommits(ctx, prepareCommitBulkInsert(dbRepo.ID, commits))
+	n, err := q.CreateCommits(ctx, prepareCommitBulkInsert(dbRepo.ID, commits))
 	if err != nil {
 		return err
 	}
@@ -135,16 +165,16 @@ func (s *Syncer) syncRepo(ctx context.Context, id RepoIdentifier) error {
 	return nil
 }
 
-// upsertRepository creates a repository if it doesn't exist, or updates it if it does.
-func (s *Syncer) upsertRepository(ctx context.Context, repo *model.Repository) (database.Repository, error) {
-	existingRepo, err := s.db.GetRepositoryByOwnerAndName(ctx, database.GetRepositoryByOwnerAndNameParams{
+// upsertRepository creates or updates a repository.
+func (s *Syncer) upsertRepository(ctx context.Context, q database.Querier, repo *model.Repository) (database.Repository, error) {
+	existingRepo, err := q.GetRepositoryByOwnerAndName(ctx, database.GetRepositoryByOwnerAndNameParams{
 		Owner: repo.Owner,
 		Name:  repo.Name,
 	})
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.logger.Info("Repository not found in DB, creating new entry")
-		return s.db.CreateRepository(ctx, database.CreateRepositoryParams{
+		return q.CreateRepository(ctx, database.CreateRepositoryParams{
 			GithubRepoID:    repo.GithubRepoID,
 			Owner:           repo.Owner,
 			Name:            repo.Name,
@@ -163,7 +193,7 @@ func (s *Syncer) upsertRepository(ctx context.Context, repo *model.Repository) (
 	}
 
 	s.logger.Info("Repository found in DB, updating metadata")
-	return s.db.UpdateRepositorySyncData(ctx, database.UpdateRepositorySyncDataParams{
+	return q.UpdateRepositorySyncData(ctx, database.UpdateRepositorySyncDataParams{
 		ID:              existingRepo.ID,
 		Description:     toSQLNullString(repo.Description).String,
 		Language:        toSQLNullString(repo.Language).String,
@@ -175,22 +205,9 @@ func (s *Syncer) upsertRepository(ctx context.Context, repo *model.Repository) (
 	})
 }
 
-// toSQLNullString is a helper to convert a pointer-to-string to a sql.NullString.
-func toSQLNullString(s *string) sql.NullString {
-	if s == nil || *s == "" {
-		return sql.NullString{}
-	}
-	return sql.NullString{
-		String: *s,
-		Valid:  true,
-	}
-}
-
-// getSinceTimestamp determines the correct time to start fetching commits from.
-// It returns the date of the latest commit we have, or the default start date if none exist.
-func (s *Syncer) getSinceTimestamp(ctx context.Context, repoID int64) (time.Time, error) {
-	latestCommitDate, err := s.db.GetLatestCommitDateForRepo(ctx, repoID)
-	if err != nil {
+func (s *Syncer) getSinceTimestamp(ctx context.Context, q database.Querier, repoID int64) (time.Time, error) {
+	latestCommitDate, err := q.GetLatestCommitDateForRepo(ctx, repoID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, err
 	}
 
@@ -200,12 +217,21 @@ func (s *Syncer) getSinceTimestamp(ctx context.Context, repoID int64) (time.Time
 	}
 
 	s.logger.Info("Found latest commit in DB", "timestamp", latestCommitDate.Time)
-
 	return latestCommitDate.Time.Add(1 * time.Second), nil
 }
 
-// prepareCommitBulkInsert transforms a slice of our domain model commits into the format
-// required by sqlc for a bulk `COPY FROM` operation.
+func parseRepoIdentifiers(repos []string) ([]RepoIdentifier, error) {
+	var identifiers []RepoIdentifier
+	for _, r := range repos {
+		parts := strings.Split(r, "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, &custom_errors.ErrInvalidRepoFormat{Repo: r}
+		}
+		identifiers = append(identifiers, RepoIdentifier{Owner: parts[0], Name: parts[1]})
+	}
+	return identifiers, nil
+}
+
 func prepareCommitBulkInsert(repoID int64, commits []model.Commit) []database.CreateCommitsParams {
 	params := make([]database.CreateCommitsParams, len(commits))
 	for i, c := range commits {
@@ -222,14 +248,12 @@ func prepareCommitBulkInsert(repoID int64, commits []model.Commit) []database.Cr
 	return params
 }
 
-func parseRepoIdentifiers(repos []string) ([]RepoIdentifier, error) {
-	var identifiers []RepoIdentifier
-	for _, r := range repos {
-		parts := strings.Split(r, "/")
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			return nil, errors.New("invalid repository format: " + r + ", expected 'owner/name'")
-		}
-		identifiers = append(identifiers, RepoIdentifier{Owner: parts[0], Name: parts[1]})
+func toSQLNullString(s *string) sql.NullString {
+	if s == nil {
+		return sql.NullString{}
 	}
-	return identifiers, nil
+	return sql.NullString{
+		String: *s,
+		Valid:  *s != "",
+	}
 }

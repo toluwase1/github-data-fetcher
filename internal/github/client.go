@@ -3,23 +3,31 @@ package github
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"github-data-fetcher/internal/model"
 	"log/slog"
+	"math"
+	"math/rand" // Import math/rand
 	"time"
 
 	"github.com/google/go-github/v62/github"
 	"golang.org/x/oauth2"
 )
 
-// Client is a wrapper around the go-github client.
+const (
+	maxRetries    = 5
+	retryMinDelay = 1 * time.Second
+	retryMaxDelay = 120 * time.Second
+)
+
+// Client is a wrapper around the go-github client that adds resilience.
 type Client struct {
 	gh     *github.Client
 	logger *slog.Logger
+	r      *rand.Rand // Add a random source for jitter
 }
 
 // NewClient creates and configures a new Client instance.
-// The provided token is used to create an authenticated http.Client.
 func NewClient(token string, logger *slog.Logger) *Client {
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
@@ -30,34 +38,49 @@ func NewClient(token string, logger *slog.Logger) *Client {
 	return &Client{
 		gh:     github.NewClient(tc),
 		logger: logger,
+		// Create a non-global random source to be concurrency-safe.
+		r: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
-// GetRepository fetches repository details and translates them to our internal model.
+// GetRepository fetches repository details with retry logic.
 func (c *Client) GetRepository(ctx context.Context, owner, name string) (*model.Repository, error) {
-	repo, _, err := c.gh.Repositories.Get(ctx, owner, name)
+	var repo *github.Repository
+	var resp *github.Response
+	var err error
+
+	err = c.retry(ctx, func() (*github.Response, error) {
+		repo, resp, err = c.gh.Repositories.Get(ctx, owner, name)
+		return resp, err
+	})
+
 	if err != nil {
 		return nil, err
 	}
 	return toInternalRepository(repo), nil
 }
 
-// GetCommits fetches all commits for a repository since a given time.
-// It handles API pagination transparently.
+// GetCommits fetches all commits for a repository since a given time, with retries and pagination.
 func (c *Client) GetCommits(ctx context.Context, owner, name string, since time.Time) ([]model.Commit, error) {
 	var allCommits []model.Commit
 
 	opts := &github.CommitsListOptions{
 		Since: since,
 		ListOptions: github.ListOptions{
-			PerPage: 100, // Max per page
+			PerPage: 100,
 		},
 	}
 
 	for {
-		c.logger.Debug("Fetching commits page", "owner", owner, "repo", name, "page", opts.Page)
+		var commits []*github.RepositoryCommit
+		var resp *github.Response
+		var err error
 
-		commits, resp, err := c.gh.Repositories.ListCommits(ctx, owner, name, opts)
+		err = c.retry(ctx, func() (*github.Response, error) {
+			c.logger.Debug("Fetching commits page", "owner", owner, "repo", name, "page", opts.Page)
+			commits, resp, err = c.gh.Repositories.ListCommits(ctx, owner, name, opts)
+			return resp, err
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -75,7 +98,69 @@ func (c *Client) GetCommits(ctx context.Context, owner, name string, since time.
 	return allCommits, nil
 }
 
-// toInternalRepository translates a github.Repository object to our internal model.Repository.
+// retry is a generic retry wrapper for GitHub API calls.
+func (c *Client) retry(ctx context.Context, fn func() (*github.Response, error)) error {
+	var err error
+	var resp *github.Response
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err = fn()
+		if err == nil {
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		var rateLimitErr *github.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			sleepDuration := time.Until(rateLimitErr.Rate.Reset.Time)
+			c.logger.Warn("GitHub API rate limit exceeded. Waiting for reset.", "wait_duration", sleepDuration)
+			select {
+			case <-time.After(sleepDuration):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		var abuseErr *github.AbuseRateLimitError
+		if errors.As(err, &abuseErr) {
+			sleepDuration := abuseErr.GetRetryAfter()
+			c.logger.Warn("GitHub API abuse mechanism triggered. Waiting.", "wait_duration", sleepDuration)
+			select {
+			case <-time.After(sleepDuration):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		if resp != nil && resp.StatusCode >= 500 {
+			backoff := float64(retryMinDelay) * math.Pow(2, float64(attempt))
+			if backoff > float64(retryMaxDelay) {
+				backoff = float64(retryMaxDelay)
+			}
+			// Add jitter: backoff ± 25%
+			jitter := (c.r.Float64() - 0.5) * backoff * 0.5
+			sleepDuration := time.Duration(backoff + jitter)
+
+			c.logger.Warn("GitHub API server error. Retrying.", "status_code", resp.StatusCode, "attempt", attempt+1, "backoff", sleepDuration)
+			select {
+			case <-time.After(sleepDuration):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		return err
+	}
+
+	return err
+}
+
 func toInternalRepository(r *github.Repository) *model.Repository {
 	return &model.Repository{
 		GithubRepoID:    r.GetID(),
@@ -93,7 +178,6 @@ func toInternalRepository(r *github.Repository) *model.Repository {
 	}
 }
 
-// toInternalCommit translates a github.RepositoryCommit object to our internal model.Commit.
 func toInternalCommit(c *github.RepositoryCommit) model.Commit {
 	return model.Commit{
 		SHA:         c.GetSHA(),
@@ -102,16 +186,5 @@ func toInternalCommit(c *github.RepositoryCommit) model.Commit {
 		Message:     c.GetCommit().GetMessage(),
 		URL:         c.GetHTMLURL(),
 		CommitDate:  c.GetCommit().GetAuthor().GetDate().Time,
-	}
-}
-
-// toNullString is a helper to convert a pointer-to-string to a sql.NullString.
-func toNullString(s *string) sql.NullString {
-	if s == nil || *s == "" {
-		return sql.NullString{}
-	}
-	return sql.NullString{
-		String: *s,
-		Valid:  true,
 	}
 }

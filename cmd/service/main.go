@@ -11,13 +11,11 @@ import (
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
-
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github-data-fetcher/internal/config"
-	"github-data-fetcher/internal/database"
 	"github-data-fetcher/internal/github"
 	"github-data-fetcher/internal/syncer"
 )
@@ -62,9 +60,8 @@ func run() error {
 	logger.Info("Database migrations applied successfully")
 
 	// 5. Initialize application components
-	dbStore := database.New(dbpool)
 	ghClient := github.NewClient(cfg.GithubToken, logger)
-	appSyncer, err := syncer.NewSyncer(dbStore, ghClient, logger, cfg.ReposToSync, cfg.SyncInterval, cfg.DefaultSyncSinceTime)
+	appSyncer, err := syncer.NewSyncer(dbpool, ghClient, logger, cfg.ReposToSync, cfg.SyncInterval, cfg.DefaultSyncSinceTime)
 	if err != nil {
 		return fmt.Errorf("failed to create syncer: %w", err)
 	}
@@ -77,8 +74,7 @@ func run() error {
 	<-ctx.Done()
 	logger.Info("Shutdown signal received. Exiting.")
 
-	// Allow some time for graceful shutdown of background tasks if needed
-	// In a more complex app, we'd use a WaitGroup here.
+	// Allow some time for graceful shutdown of background tasks
 	time.Sleep(2 * time.Second)
 
 	return nil
